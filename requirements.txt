@@ -1,0 +1,8 @@
+# Pipecat: orquestador del pipeline de voz.
+# Extras: deepgram (STT), anthropic (LLM), elevenlabs (TTS), silero (VAD), local (audio del micro/altavoz vía PyAudio)
+pipecat-ai[deepgram,anthropic,elevenlabs,silero,local]>=1.1,<2
+
+# SDK de Anthropic para el evaluador post-sesión (fuera del pipeline de voz)
+anthropic>=0.40
+
+python-dotenv>=1.0
