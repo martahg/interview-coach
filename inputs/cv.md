@@ -1,3 +1,3 @@
 # CV
 
-Pega aquí tu CV en texto plano o markdown (en inglés).
+Paste your CV here (plain text or markdown), in English.
