@@ -1,11 +1,12 @@
 """
-Entrevista simulada por voz en tiempo real.
+Real-time voice mock interview.
 
-Flujo: micrófono -> VAD -> STT (Deepgram) -> LLM (Claude) -> TTS (ElevenLabs) -> altavoz
-Al terminar (Ctrl+C) guarda la transcripción en sessions/.
+Flow: microphone -> VAD -> STT (Deepgram) -> LLM (Claude) -> TTS (ElevenLabs) -> speaker
+When the call ends (Ctrl+C), the transcript is saved to sessions/.
 
-Uso:
+Usage:
     python interview.py
+    NUM_QUESTIONS=3 python interview.py   # short interview (demo)
 """
 
 import asyncio
@@ -44,16 +45,21 @@ load_dotenv(ROOT / ".env")
 
 
 def build_system_prompt(persona: str) -> str:
-    """Rellena la plantilla de la persona con tu CV y la oferta."""
+    """Fill the persona template with the CV, the job description and the interview length."""
     template = (ROOT / "prompts" / f"{persona}.md").read_text(encoding="utf-8")
     cv = (ROOT / "inputs" / "cv.md").read_text(encoding="utf-8")
     jd = (ROOT / "inputs" / "jd.md").read_text(encoding="utf-8")
-    # replace() en vez de format() para no romper con llaves que haya en el CV/JD
-    return template.replace("{cv}", cv).replace("{jd}", jd)
+    num_questions = os.getenv("NUM_QUESTIONS", "4 to 6")
+    # replace() instead of format(), so curly braces in the CV or JD don't break it
+    return (
+        template.replace("{cv}", cv)
+        .replace("{jd}", jd)
+        .replace("{num_questions}", num_questions)
+    )
 
 
 def load_keyterms() -> list[str]:
-    """Lee inputs/keyterms.txt (opcional): un término por línea, # para comentarios."""
+    """Read inputs/keyterms.txt (optional): one term per line, # for comments."""
     path = ROOT / "inputs" / "keyterms.txt"
     if not path.exists():
         return []
@@ -62,7 +68,7 @@ def load_keyterms() -> list[str]:
 
 
 def save_session(persona: str, messages: list) -> Path | None:
-    """Guarda la conversación (sin el system prompt) para el evaluador."""
+    """Save the conversation (without the internal start message) for the evaluator."""
     sessions = ROOT / "sessions"
     sessions.mkdir(exist_ok=True)
     path = sessions / f"{datetime.now():%Y%m%d-%H%M%S}-{persona}.json"
@@ -82,8 +88,8 @@ def save_session(persona: str, messages: list) -> Path | None:
 async def main():
     persona = os.getenv("PERSONA", "recruiter")
 
-    # 1. TRANSPORTE: entrada/salida de audio. Aquí, micro y altavoz locales.
-    #    El VAD ya no va aquí: en Pipecat 1.x se configura en el aggregator (punto 5).
+    # 1. TRANSPORT: audio in and out. Here, the local microphone and speaker.
+    #    VAD is configured on the user aggregator (step 5), as Pipecat 1.x expects.
     transport = LocalAudioTransport(
         LocalAudioTransportParams(
             audio_in_enabled=True,
@@ -91,10 +97,10 @@ async def main():
         )
     )
 
-    # 2. STT: audio -> texto en streaming.
-    #    Configurado para transcripción lo más literal posible (sin smart_format),
-    #    porque el evaluador necesita ver cómo hablaste de verdad.
-    #    keyterm: nombres propios y jerga de inputs/keyterms.txt para reconocerlos mejor.
+    # 2. STT: streaming speech-to-text.
+    #    As literal as possible (no smart_format): the evaluator needs to see how you
+    #    actually spoke. keyterm boosts recognition of names and jargon listed in
+    #    inputs/keyterms.txt.
     stt = DeepgramSTTService(
         api_key=os.environ["DEEPGRAM_API_KEY"],
         settings=DeepgramSTTService.Settings(
@@ -105,12 +111,12 @@ async def main():
             interim_results=True,
             keyterm=load_keyterms() or None,
         ),
-        # filler_words no se pasa: el deepgram-sdk instalado (7.16.0) solo expone ese
-        # parámetro en el endpoint de audio pregrabado, no en connect() de streaming,
-        # así que cualquier valor en `addons` rompe la conexión en tiempo real.
+        # filler_words is not set: deepgram-sdk 7.16 only supports it for pre-recorded
+        # audio, not for streaming, and passing it through `addons` breaks the
+        # real-time connection.
     )
 
-    # 3. LLM: el "cerebro" del entrevistador.
+    # 3. LLM: the interviewer. A fast model, because time to first token drives latency.
     llm = AnthropicLLMService(
         api_key=os.environ["ANTHROPIC_API_KEY"],
         settings=AnthropicLLMService.Settings(
@@ -119,20 +125,21 @@ async def main():
         ),
     )
 
-    # 4. TTS: texto -> voz en streaming (empieza a hablar antes de tener la frase entera).
+    # 4. TTS: streaming text-to-speech (starts speaking before the full reply is ready).
     tts = ElevenLabsTTSService(
         api_key=os.environ["ELEVENLABS_API_KEY"],
         settings=ElevenLabsTTSService.Settings(voice=os.environ["ELEVENLABS_VOICE_ID"]),
     )
 
-    # 5. CONTEXTO Y TURNOS
-    #    El system prompt va en el `system_instruction` del LLM; aquí solo vive el
-    #    historial user/assistant que añaden los "aggregators" cada turno.
+    # 5. CONTEXT AND TURN-TAKING
+    #    The system prompt lives in the LLM's system_instruction. The context only holds
+    #    the user/assistant history, which the aggregators extend on every turn.
+    #    The Claude API needs at least one user message, so START_MSG opens the call.
     context = LLMContext(messages=[{"role": "user", "content": START_MSG}])
 
-    #    Fin de turno: se cierra solo cuando el modelo Smart Turn cree que has
-    #    terminado Y llevas USER_SPEECH_TIMEOUT segundos en silencio.
-    #    Súbelo en .env si te corta al pensar; bájalo si se hace lento.
+    #    A user turn ends only when Smart Turn thinks you have finished AND you have
+    #    been silent for USER_SPEECH_TIMEOUT seconds. Raise it in .env if you get cut
+    #    off while thinking; lower it if responses feel slow.
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
@@ -148,42 +155,42 @@ async def main():
         ),
     )
 
-    # 6. PIPELINE: el orden en que fluyen los frames (unidades de datos: audio, texto, eventos).
+    # 6. PIPELINE: the order in which frames (audio, text, events) flow.
     pipeline = Pipeline(
         [
-            transport.input(),               # audio del micro
-            stt,                             # -> texto de lo que dices
-            context_aggregator.user(),       # -> lo añade al historial como turno "user"
-            llm,                             # -> genera la respuesta en streaming
-            tts,                             # -> la convierte en audio
-            transport.output(),              # -> la reproduce
-            context_aggregator.assistant(),  # -> guarda lo que dijo el entrevistador
+            transport.input(),               # microphone audio
+            stt,                             # -> text of what you said
+            context_aggregator.user(),       # -> added to the history as a "user" turn
+            llm,                             # -> streamed reply
+            tts,                             # -> converted to audio
+            transport.output(),              # -> played back
+            context_aggregator.assistant(),  # -> what the interviewer said is saved
         ]
     )
 
     worker = PipelineWorker(
         pipeline,
         params=PipelineParams(
-            allow_interruptions=True,  # "barge-in": si hablas, el entrevistador se calla
-            enable_metrics=True,       # latencias por componente en el log
+            allow_interruptions=True,  # barge-in: if you speak, the interviewer stops
+            enable_metrics=True,       # per-service latency in the log
         ),
     )
 
-    # El entrevistador abre la llamada sin esperar a que hables.
+    # The interviewer opens the call without waiting for you.
     await worker.queue_frames([LLMRunFrame()])
 
     runner = WorkerRunner(handle_sigint=True)
     await runner.add_workers(worker)
     try:
-        logger.info(f"Entrevista '{persona}' en marcha. Ctrl+C para terminar.")
+        logger.info(f"Interview '{persona}' running. Press Ctrl+C to end.")
         await runner.run()
     finally:
         path = save_session(persona, context.get_messages())
         if path:
-            logger.info(f"Transcripción guardada en {path}")
-            logger.info(f"Evalúala con: python evaluate.py {path}")
+            logger.info(f"Transcript saved to {path}")
+            logger.info(f"Evaluate it with: python evaluate.py {path}")
         else:
-            logger.info("Sesión sin respuestas del candidato: no se guarda.")
+            logger.info("No answers from the candidate: session not saved.")
 
 
 if __name__ == "__main__":
