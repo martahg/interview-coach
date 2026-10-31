@@ -14,23 +14,23 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from deepgram import LiveOptions
 from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+from pipecat.workers.runner import WorkerRunner
 
 ROOT = Path(__file__).parent
+START_MSG = "(The call has just connected. Greet the candidate and start the interview.)"
 load_dotenv(ROOT / ".env")
 
 
@@ -43,12 +43,17 @@ def build_system_prompt(persona: str) -> str:
     return template.replace("{cv}", cv).replace("{jd}", jd)
 
 
-def save_session(persona: str, messages: list) -> Path:
+def save_session(persona: str, messages: list) -> Path | None:
     """Guarda la conversación (sin el system prompt) para el evaluador."""
     sessions = ROOT / "sessions"
     sessions.mkdir(exist_ok=True)
     path = sessions / f"{datetime.now():%Y%m%d-%H%M%S}-{persona}.json"
-    turns = [m for m in messages if m.get("role") in ("user", "assistant")]
+    turns = [
+        m for m in messages
+        if m.get("role") in ("user", "assistant") and m.get("content") != START_MSG
+    ]
+    if not any(t["role"] == "user" for t in turns):
+        return None
     path.write_text(
         json.dumps({"persona": persona, "turns": turns}, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -70,35 +75,43 @@ async def main():
     )
 
     # 2. STT: audio -> texto en streaming.
-    #    Configurado para transcripción LITERAL: sin smart_format y con muletillas,
+    #    Configurado para transcripción lo más literal posible (sin smart_format),
     #    porque el evaluador necesita ver cómo hablaste de verdad.
     stt = DeepgramSTTService(
         api_key=os.environ["DEEPGRAM_API_KEY"],
-        live_options=LiveOptions(
-            model="nova-3",
+        settings=DeepgramSTTService.Settings(
+            model="nova-3-general",
             language="en-US",
             smart_format=False,
             punctuate=True,
-            filler_words=True,
             interim_results=True,
         ),
+        # filler_words no se pasa: el deepgram-sdk instalado (7.16.0) solo expone ese
+        # parámetro en el endpoint de audio pregrabado, no en connect() de streaming,
+        # así que cualquier valor en `addons` rompe la conexión en tiempo real.
     )
 
     # 3. LLM: el "cerebro" del entrevistador.
     llm = AnthropicLLMService(
         api_key=os.environ["ANTHROPIC_API_KEY"],
-        model=os.getenv("INTERVIEWER_MODEL", "claude-sonnet-5-5"),
+        settings=AnthropicLLMService.Settings(
+            model=os.getenv("INTERVIEWER_MODEL", "claude-sonnet-5-5"),
+            system_instruction=build_system_prompt(persona),
+        ),
     )
 
     # 4. TTS: texto -> voz en streaming (empieza a hablar antes de tener la frase entera).
     tts = ElevenLabsTTSService(
         api_key=os.environ["ELEVENLABS_API_KEY"],
-        voice_id=os.environ["ELEVENLABS_VOICE_ID"],
+        settings=ElevenLabsTTSService.Settings(voice=os.environ["ELEVENLABS_VOICE_ID"]),
     )
 
     # 5. CONTEXTO: el historial de la conversación que se envía al LLM en cada turno.
-    #    Los "aggregators" añaden tus frases (user) y las respuestas (assistant) al historial.
-    context = LLMContext(messages=[{"role": "system", "content": build_system_prompt(persona)}])
+    #    El system prompt va en el `system_instruction` del LLM (arriba); aquí solo
+    #    vive el historial user/assistant que añaden los "aggregators" cada turno.
+    context = LLMContext(
+        messages=[{"role": "user", "content": START_MSG}]
+    )
     context_aggregator = LLMContextAggregatorPair(context)
 
     # 6. PIPELINE: el orden en que fluyen los frames (unidades de datos: audio, texto, eventos).
@@ -114,7 +127,7 @@ async def main():
         ]
     )
 
-    task = PipelineTask(
+    worker = PipelineWorker(
         pipeline,
         params=PipelineParams(
             allow_interruptions=True,  # "barge-in": si hablas, el entrevistador se calla
@@ -123,16 +136,20 @@ async def main():
     )
 
     # El entrevistador abre la llamada sin esperar a que hables.
-    await task.queue_frames([LLMRunFrame()])
+    await worker.queue_frames([LLMRunFrame()])
 
-    runner = PipelineRunner(handle_sigint=True)
+    runner = WorkerRunner(handle_sigint=True)
+    await runner.add_workers(worker)
     try:
         logger.info(f"Entrevista '{persona}' en marcha. Ctrl+C para terminar.")
-        await runner.run(task)
+        await runner.run()
     finally:
         path = save_session(persona, context.get_messages())
-        logger.info(f"Transcripción guardada en {path}")
-        logger.info(f"Evalúala con: python evaluate.py {path}")
+        if path:
+            logger.info(f"Transcripción guardada en {path}")
+            logger.info(f"Evalúala con: python evaluate.py {path}")
+        else:
+            logger.info("Sesión sin respuestas del candidato: no se guarda.")
 
 
 if __name__ == "__main__":
