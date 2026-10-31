@@ -176,3 +176,13 @@ Tested with **Pipecat 1.14** and **deepgram-sdk 7.16**. Pipecat moves fast, so i
 ## Built with
 
 [Pipecat](https://github.com/pipecat-ai/pipecat) · [Deepgram](https://deepgram.com) · [Anthropic Claude](https://www.anthropic.com) · [ElevenLabs](https://elevenlabs.io) · [Silero VAD](https://github.com/snakers4/silero-vad)
+
+---
+
+## License
+
+Copyright (C) 2026 Marta Hernández Granado
+
+This project is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+If you run a modified version of this software as a network service, you must make
+its source code available to the users of that service.

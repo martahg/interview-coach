@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Marta Hernández Granado
+
 """
 Post-session evaluator. Not real time: it reads a saved transcript and writes
 a markdown report with feedback on content and English.

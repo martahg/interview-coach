@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Marta Hernández Granado
+
 """
 Real-time voice mock interview.
 
