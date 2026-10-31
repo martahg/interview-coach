@@ -1,0 +1,3 @@
+# Nombres propios y términos técnicos que el STT debe reconocer mejor.
+# Un término por línea: empresas, productos, tecnologías de tu CV y de la oferta.
+# Mantén la lista corta (unas decenas como mucho).
