@@ -1,170 +1,178 @@
-# Interview Coach (MVP)
+# Interview Coach
 
-Simulador de entrevistas en inglés por voz en tiempo real. Hablas con un "recruiter" generado por IA y, al terminar, otro modelo te devuelve un informe con feedback de contenido (estructura STAR, lo que faltó) y de inglés (errores concretos, patrones, nivel CEFR estimado).
+**Practice job interviews in English, out loud, with an AI interviewer, and get a detailed report on what you said and how you said it.**
 
-```
-inputs/cv.md, inputs/jd.md ──┐
-inputs/keyterms.txt ─────────┤
-prompts/recruiter.md ────────┤
-                             ▼
-                     interview.py  ──►  sessions/xxx.json  ──►  evaluate.py  ──►  sessions/xxx.report.md
-                   (voz, tiempo real)     (transcripción)        (sin prisa)         (tu feedback)
-```
+You talk to a voice-based recruiter in real time. It knows your CV and the job you are applying for. It asks follow-up questions when your answers are vague, and it lets you interrupt it. When the call ends, a second model reviews the transcript and writes a report covering:
 
-Son dos programas separados a propósito: la entrevista necesita **latencia baja** y la evaluación necesita **calidad**. Cada uno usa el modelo adecuado.
+- **Content**: answer by answer, with a STAR check for behavioral questions and a stronger version of each key answer, built only from facts in your CV.
+- **English**: concrete errors with corrections, recurring patterns (tense, articles, false friends from your native language), vocabulary upgrades and an estimated CEFR level for spoken production.
+- **Next session**: three specific things to work on.
 
----
+Built for non-native speakers preparing for interviews in English. It is aimed at senior engineers, where the hard part is telling a complex story clearly under pressure.
 
-## 1. Cómo funciona una conversación por voz
-
-Una conversación por voz con IA es una cadena de cuatro tareas que se ejecutan una tras otra en cada turno:
-
-```
-Tú hablas ─► [¿has terminado?] ─► [audio a texto] ─► [pensar respuesta] ─► [texto a audio] ─► Oyes la respuesta
-              VAD + Smart Turn         STT                  LLM                   TTS
-```
-
-El reto no es cada pieza por separado, es que **todo ocurra en menos de ~1 segundo** para que se sienta natural. Para conseguirlo, nada espera a que el paso anterior termine del todo: cada pieza trabaja en **streaming** y pasa resultados parciales a la siguiente. Por ejemplo, el TTS empieza a hablar con la primera frase del LLM mientras este sigue generando la segunda.
-
-### Conceptos clave
-
-**Frame.** La unidad de datos que circula por el pipeline. Un trozo de audio de 20ms es un frame, una palabra transcrita es un frame, "el usuario ha empezado a hablar" es un frame. Piensa en mensajes de una cola, pero en memoria y con milisegundos de vida.
-
-**Pipeline.** Una lista ordenada de procesadores. Cada frame entra por arriba y cada procesador decide si lo transforma, lo deja pasar o genera frames nuevos. Es el mismo patrón que un pipeline de middlewares HTTP o un flujo de Pub/Sub, pero síncrono en el tiempo real del audio.
-
-**Transport.** La puerta de entrada y salida del audio. En el MVP es tu micro y tu altavoz (`LocalAudioTransport`). Más adelante se cambia por WebRTC para usarlo desde el navegador o el móvil, y el resto del pipeline no se toca.
-
-**VAD (Voice Activity Detection).** Un modelo pequeño (Silero, corre en local en tu CPU) que distingue voz de silencio o ruido. Responde a "¿está hablando alguien ahora mismo?".
-
-**Turn-taking / endpointing.** Decidir que **has terminado tu turno**. Es lo más delicado de todo el sistema: si espera poco, te interrumpe cuando haces una pausa para pensar; si espera mucho, la conversación se siente lenta. Aquí se combinan dos señales y el turno solo se cierra cuando **las dos** están de acuerdo:
-- **Smart Turn**: un modelo local que analiza la entonación y decide si la frase suena terminada.
-- **Silencio mínimo** (`USER_SPEECH_TIMEOUT`, 1,5 s por defecto): evita que una pausa breve para pensar se tome como fin de turno.
-
-**Barge-in (interrupciones).** Si empiezas a hablar mientras el entrevistador habla, se calla y te escucha. Lo activa `allow_interruptions=True`. Pipecat corta el audio pendiente y descarta la parte de la respuesta que no llegó a decirse.
-
-**Contexto.** El historial de la conversación que se envía al LLM en cada respuesta. El system prompt (persona + CV + oferta) va aparte, en el `system_instruction` del LLM. Los LLM no tienen memoria propia: "recordar" lo que dijiste hace 5 minutos es simplemente que eso va incluido en cada petición.
+> 🎥 **Demo:** _coming soon_
 
 ---
 
-## 2. Cada pieza y por qué la elegí
+## How it works
 
-### Pipecat — el orquestador
-Framework open source en Python (licencia BSD) que resuelve la parte difícil: mover frames entre servicios, gestionar el streaming, los turnos, las interrupciones y la cancelación. Tú solo declaras el orden de las piezas. Alternativa: LiveKit Agents, más orientado a producción con muchos usuarios simultáneos; para uso personal Pipecat es más directo.
+```mermaid
+flowchart LR
+    subgraph inputs[Inputs]
+        CV[cv.md]
+        JD[jd.md]
+        KT[keyterms.txt]
+        P[prompts/recruiter.md]
+    end
 
-### Deepgram — STT (speech-to-text)
-Convierte tu voz en texto mientras hablas. Devuelve dos tipos de resultado:
-- **Interim**: lo que cree que estás diciendo ahora, cambia sobre la marcha.
-- **Final**: la versión definitiva de un fragmento.
+    subgraph live[interview.py · real time]
+        MIC((Mic)) --> VAD[Silero VAD<br/>+ Smart Turn]
+        VAD --> STT[Deepgram<br/>STT]
+        STT --> LLM[Claude Sonnet<br/>interviewer]
+        LLM --> TTS[ElevenLabs<br/>TTS]
+        TTS --> SPK((Speaker))
+    end
 
-Configuración importante en `interview.py`:
-- `smart_format=False`: no "embellece" el texto, para que el evaluador vea cómo hablaste de verdad.
-- `keyterm`: lista de nombres propios y jerga técnica (de `inputs/keyterms.txt`) que el STT debe reconocer mejor. Sin ella, términos como "serializable" o el nombre de una empresa salen mal transcritos y el evaluador los confunde con errores tuyos.
-- Las muletillas ("um", "uh") no se conservan: el SDK actual de Deepgram no expone `filler_words` en streaming. El evaluador lo sabe y no juzga la fluidez por su ausencia.
+    subgraph offline[evaluate.py · offline]
+        EV[Claude Opus<br/>evaluator]
+    end
 
-### Claude — LLM (el entrevistador)
-Genera las respuestas del recruiter a partir del contexto. Usa un modelo rápido (Sonnet) porque lo que importa es el **tiempo hasta el primer token**: cuanto antes empiece a generar, antes empieza a hablar el TTS.
+    inputs --> LLM
+    KT --> STT
+    LLM -- transcript --> S[(sessions/*.json)]
+    S --> EV
+    EV --> R[report.md]
+```
 
-El comportamiento entero está en `prompts/recruiter.md`. Cosas que importan para voz:
-- **Sin markdown ni listas**: el TTS leería los asteriscos o sonaría a robot.
-- **Una pregunta por turno**: igual que un humano.
-- **No dar feedback durante la llamada**: el entrevistador se mantiene en su papel; el feedback es trabajo del evaluador.
+There are two separate programs, on purpose:
 
-La API de Claude exige al menos un mensaje de usuario, así que la conversación arranca con un mensaje interno (`START_MSG`) que pide al entrevistador abrir la llamada. Se filtra al guardar la sesión.
-
-### ElevenLabs — TTS (text-to-speech)
-Convierte el texto en voz natural, también en streaming. `ELEVENLABS_VOICE_ID` elige la voz; cuando añadas el entrevistador técnico, dale otra voz distinta para que la diferencia de rol se note.
-
-**En el plan gratuito, usa una voz predeterminada de ElevenLabs** (las que vienen con la cuenta). Las voces de la Voice Library de la comunidad devuelven `402 Payment Required` por API aunque las añadas a "My Voices".
-
-Alternativas: Cartesia, o el TTS de Deepgram (Aura-2), que reutiliza la misma key del STT.
-
-### Claude — evaluador (`evaluate.py`)
-No forma parte del pipeline de voz. Es una llamada normal a la API al terminar, con un modelo más potente (Opus), porque aquí no importa tardar 30 segundos. Recibe la transcripción, tu CV y la oferta, y escribe el informe según `prompts/evaluator.md`.
-
----
-
-## 3. Mapa de ficheros
-
-| Fichero | Qué hace |
-|---|---|
-| `interview.py` | Monta el pipeline de voz y guarda la transcripción al terminar |
-| `evaluate.py` | Lee una transcripción y genera el informe |
-| `prompts/recruiter.md` | Persona, guion y reglas del entrevistador (`{cv}` y `{jd}` se rellenan solos) |
-| `prompts/evaluator.md` | Rúbrica del informe |
-| `inputs/cv.md`, `inputs/jd.md` | Tu CV y la oferta (en inglés) |
-| `inputs/keyterms.txt` | Opcional: términos para el STT, uno por línea (`#` para comentarios) |
-| `.env` | Claves y configuración (no se sube al repo) |
-| `sessions/` | Se crea solo: transcripciones (`.json`) e informes (`.report.md`) |
-
-Para añadir otro entrevistador (por ejemplo, el técnico), crea `prompts/tech_lead.md` y ejecuta con `PERSONA=tech_lead`.
-
-### Variables de `.env`
-
-| Variable | Para qué |
-|---|---|
-| `DEEPGRAM_API_KEY`, `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY` | Claves de los servicios |
-| `ELEVENLABS_VOICE_ID` | Voz del entrevistador |
-| `INTERVIEWER_MODEL` | Modelo del entrevistador (prioriza latencia) |
-| `EVALUATOR_MODEL` | Modelo del evaluador (prioriza calidad) |
-| `PERSONA` | Fichero de `prompts/` a usar como entrevistador |
-| `USER_SPEECH_TIMEOUT` | Opcional. Segundos de silencio para cerrar tu turno (1,5 por defecto) |
+| | `interview.py` | `evaluate.py` |
+|---|---|---|
+| Goal | Feel like a real call | Give accurate, detailed feedback |
+| Constraint | Latency: under ~1 s per turn | Quality: no time pressure |
+| Model | Fast (Sonnet) | Strongest (Opus) |
 
 ---
 
-## 4. Puesta en marcha
+## Design decisions
 
-Requisitos: Python 3.11+ (probado con 3.13), y en macOS `brew install portaudio` (lo necesita PyAudio para el micro).
+### A cascaded pipeline instead of speech-to-speech
+Speech-to-speech models (OpenAI Realtime, Gemini Live) have lower latency, but you have less control over the transcript and you are tied to one LLM. The whole point of this tool is to evaluate **what you said**, so a text transcript of your speech is the core artifact. A cascaded pipeline (STT → LLM → TTS) gives you that transcript, lets you choose the best model for each role, and costs less over 20–30 minute sessions. In an interview, a 600–900 ms response time feels natural, because human interviewers pause too.
+
+### Turn-taking is the hardest part
+In interviews, people pause to think. A voice agent tuned for customer support treats a 300 ms silence as "done talking" and cuts the candidate off mid-sentence. The first version did exactly that: answers came out as 3-word fragments, and the interviewer kept jumping in.
+
+The fix is to end a user turn only when **two independent signals agree**:
+1. **Smart Turn**, a local model that analyses intonation to decide whether the sentence sounds finished.
+2. **A minimum silence** (`USER_SPEECH_TIMEOUT`, 1.5 s by default), so a short thinking pause is never treated as the end of a turn.
+
+### STT artifacts are not the candidate's mistakes
+Speech-to-text mishears proper nouns and jargon. "Serializable" becomes "daily server", and "row locks" becomes "draw logs". An evaluator that trusts the transcript blindly would blame the candidate for these. Two mitigations:
+- **Keyterms** (`inputs/keyterms.txt`): names and technical terms are passed to Deepgram so it recognises them.
+- **Evaluator instructions**: the evaluator prompt says the input is an STT transcript. It tells the model to ignore likely transcription artifacts, to not judge fluency on missing filler words (the streaming API drops them), and to ignore remarks addressed to the tool.
+
+### The interviewer stays in character
+All coaching happens after the call. During the call, the interviewer behaves like a real recruiter: one question per turn, follow-ups when an answer is vague, and no corrections. Feedback in the middle of an answer breaks the pressure the exercise is meant to simulate.
+
+---
+
+## Getting started
+
+**Requirements:** Python 3.11+ (tested with 3.13), and on macOS `brew install portaudio` for microphone access.
 
 ```bash
+git clone https://github.com/<your-user>/interview-coach.git
+cd interview-coach
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # rellena las claves en .env, NO en .env.example
+cp .env.example .env    # then fill in your keys in .env
 ```
 
-Rellena `inputs/cv.md`, `inputs/jd.md` y, si quieres, `inputs/keyterms.txt`. Para que tus datos reales no se suban al repo:
+Fill in your inputs, in English:
+- `inputs/cv.md`: your CV
+- `inputs/jd.md`: the job description
+- `inputs/keyterms.txt` (optional): names and technical terms from your CV and the job, one per line
+
+To keep your real data out of git:
 ```bash
 git update-index --skip-worktree inputs/cv.md inputs/jd.md inputs/keyterms.txt
 ```
 
-Y a practicar:
+Run a session:
 ```bash
-python interview.py                          # habla; Ctrl+C para terminar
-python evaluate.py sessions/<fichero>.json   # genera sessions/<fichero>.report.md
+python interview.py                          # talk; press Ctrl+C to end
+python evaluate.py sessions/<file>.json      # writes sessions/<file>.report.md
 ```
 
-**Usa auriculares.** En local no hay cancelación de eco: si el micro capta el altavoz, el sistema oye al entrevistador, cree que eres tú y se interrumpe a sí mismo.
+**Tips**
+- **Use headphones.** There is no echo cancellation locally, so without them the interviewer hears itself and interrupts itself.
+- **To end the call, press Ctrl+C without saying anything.** Everything you say is transcribed and goes into the report.
+- On first run, macOS asks for microphone permission for your terminal.
 
-**Para terminar, pulsa Ctrl+C sin decir nada.** Todo lo que digas se transcribe y acaba en el informe.
+### API keys
 
-La primera vez, macOS pide permiso para que la terminal use el micrófono (Ajustes del Sistema → Privacidad y seguridad → Micrófono).
-
-Claves necesarias: Deepgram, Anthropic y ElevenLabs. Deepgram y ElevenLabs tienen tier gratuito suficiente para probar; la API de Anthropic es de pago (unos pocos dólares dan para muchas sesiones) y se factura aparte de la suscripción de Claude.
-
----
-
-## 5. Ajustes y problemas conocidos
-
-Probado con **Pipecat 1.14** y **deepgram-sdk 7.16**. Pipecat evoluciona rápido; si actualizas y algún import falla, compara con los ejemplos de su repo para tu versión.
-
-| Síntoma | Causa probable | Solución |
+| Service | Used for | Free tier |
 |---|---|---|
-| Te corta cuando haces una pausa para pensar | El turno se cierra demasiado pronto | Sube `USER_SPEECH_TIMEOUT` (prueba 2) |
-| Tarda mucho en responder cuando terminas | Turno demasiado conservador, o LLM lento | Baja `USER_SPEECH_TIMEOUT` (1,2); mira la latencia de cada pieza en el log (`enable_metrics=True`) |
-| Nombres propios o términos técnicos mal transcritos | El STT no los conoce | Añádelos a `inputs/keyterms.txt` |
-| Deepgram 401, ElevenLabs 403 y Anthropic "no api_key" a la vez | `.env` vacío o claves en `.env.example` | Rellena `.env` |
-| ElevenLabs `402` o "completed with no audio" | Voz de la Voice Library en plan gratuito | Usa una voz predeterminada |
-| ElevenLabs "voice_id does not exist" | Voz no añadida a tu cuenta, o ID mal copiado | Revisa el ID en "My Voices" |
-| El entrevistador se interrumpe a sí mismo | El micro capta el altavoz | Auriculares |
+| [Deepgram](https://console.deepgram.com) | Speech-to-text | Yes, free credit on sign-up |
+| [Anthropic](https://console.anthropic.com) | Interviewer and evaluator | No. A few dollars covers many sessions |
+| [ElevenLabs](https://elevenlabs.io) | Text-to-speech | Yes. Use a **default** voice, because community voices return `402` on the free plan |
+
+### Configuration (`.env`)
+
+| Variable | Description |
+|---|---|
+| `DEEPGRAM_API_KEY`, `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY` | Service keys |
+| `ELEVENLABS_VOICE_ID` | Interviewer voice |
+| `INTERVIEWER_MODEL` | Real-time model (optimise for latency) |
+| `EVALUATOR_MODEL` | Report model (optimise for quality) |
+| `PERSONA` | Which file in `prompts/` to use as the interviewer |
+| `USER_SPEECH_TIMEOUT` | Optional. Seconds of silence before your turn ends (default `1.5`) |
 
 ---
 
-## 6. Siguientes pasos (por orden de valor)
+## Project structure
 
-1. **Entrevistador técnico** (`prompts/tech_lead.md`): system design y deep dive en tus proyectos.
-2. **Keyterms automáticos**: extraer de `cv.md` y `jd.md` los términos para el STT al arrancar, sin mantener el fichero a mano.
-3. **Memoria entre sesiones**: el evaluador guarda tus puntos débiles en un fichero y el siguiente entrevistador los recibe para insistir en ellos.
-4. **Colgar al despedirse**: una herramienta `end_call` para que el entrevistador termine la sesión sin Ctrl+C.
-5. **Investigación de la empresa**: un paso previo que busca información pública de la empresa y la añade al prompt.
-6. **WebRTC** (`SmallWebRTCTransport` de Pipecat): usarlo desde el navegador o el móvil, con cancelación de eco.
-7. **Pronunciación**: análisis del audio (no del texto), por ejemplo con Azure Pronunciation Assessment.
-8. **Modo C1**: otro `persona` (examinador Cambridge) y otra rúbrica en el evaluador. El núcleo es el mismo.
+| Path | Purpose |
+|---|---|
+| `interview.py` | Builds the real-time voice pipeline and saves the transcript |
+| `evaluate.py` | Turns a transcript into a feedback report |
+| `prompts/recruiter.md` | Interviewer persona, call structure and rules (`{cv}` and `{jd}` are filled in at runtime) |
+| `prompts/evaluator.md` | Report rubric |
+| `inputs/` | Your CV, the job description and optional STT keyterms |
+| `sessions/` | Transcripts (`.json`) and reports (`.report.md`), git-ignored |
+
+To add another interviewer, such as a technical one, create `prompts/tech_lead.md` and run with `PERSONA=tech_lead`.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Cuts you off when you pause to think | Turn ends too early | Raise `USER_SPEECH_TIMEOUT` (try `2`) |
+| Slow to respond after you finish | Turn ending is too conservative, or the LLM is slow | Lower `USER_SPEECH_TIMEOUT` (try `1.2`); check per-service latency in the log |
+| Names or tech terms transcribed wrongly | STT doesn't know them | Add them to `inputs/keyterms.txt` |
+| Deepgram 401 + ElevenLabs 403 + Anthropic "no api_key" | Keys are missing from `.env` (often put in `.env.example` by mistake) | Fill in `.env` |
+| ElevenLabs `402` / "completed with no audio" | Community voice on the free plan | Use a default voice |
+| Interviewer interrupts itself | Mic picks up the speaker | Use headphones |
+
+Tested with **Pipecat 1.14** and **deepgram-sdk 7.16**. Pipecat moves fast, so if an import breaks after an upgrade, compare with the examples in its repo.
+
+---
+
+## Roadmap
+
+- [ ] **Technical interviewer**: system design and deep dives into the candidate's projects
+- [ ] **Automatic keyterms**: extract them from the CV and job description at startup
+- [ ] **Memory across sessions**: the next interviewer focuses on the weak points from the last report
+- [ ] **End the call on goodbye**: an `end_call` tool, so the interviewer hangs up without Ctrl+C
+- [ ] **Company research**: add public information about the company to the interviewer's context
+- [ ] **Browser version**: WebRTC transport with echo cancellation
+- [ ] **Pronunciation feedback**: audio-level analysis, not just the transcript
+- [ ] **Exam mode**: the same core with an examiner persona and rubric for English certifications (C1)
+
+---
+
+## Built with
+
+[Pipecat](https://github.com/pipecat-ai/pipecat) · [Deepgram](https://deepgram.com) · [Anthropic Claude](https://www.anthropic.com) · [ElevenLabs](https://elevenlabs.io) · [Silero VAD](https://github.com/snakers4/silero-vad)
