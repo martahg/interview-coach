@@ -10,7 +10,9 @@ You talk to a voice-based recruiter in real time. It knows your CV and the job y
 
 Built for non-native speakers preparing for interviews in English. It is aimed at senior engineers, where the hard part is telling a complex story clearly under pressure.
 
-> 🎥 **Demo:** _coming soon_
+> 🎥 **Demo:** 
+
+https://github.com/user-attachments/assets/b74922ac-4138-4da1-a6a1-53f87dad4029
 
 ---
 
@@ -81,7 +83,7 @@ All coaching happens after the call. During the call, the interviewer behaves li
 **Requirements:** Python 3.11+ (tested with 3.13), and on macOS `brew install portaudio` for microphone access.
 
 ```bash
-git clone https://github.com/<your-user>/interview-coach.git
+git clone https://github.com/martahg/interview-coach.git
 cd interview-coach
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
