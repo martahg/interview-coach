@@ -10,11 +10,13 @@ When the call ends (Ctrl+C), the transcript is saved to sessions/.
 Usage:
     python interview.py
     NUM_QUESTIONS=3 python interview.py   # short interview (demo)
+    LOG_LEVEL=DEBUG python interview.py   # verbose logs (prints the prompt)
 """
 
 import asyncio
 import json
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -45,6 +47,10 @@ from pipecat.workers.runner import WorkerRunner
 ROOT = Path(__file__).parent
 START_MSG = "(The call has just connected. Greet the candidate and start the interview.)"
 load_dotenv(ROOT / ".env")
+
+# INFO by default: DEBUG logs print the full system prompt, including the CV.
+logger.remove()
+logger.add(sys.stderr, level=os.getenv("LOG_LEVEL", "INFO"))
 
 
 def build_system_prompt(persona: str) -> str:
@@ -175,7 +181,7 @@ async def main():
         pipeline,
         params=PipelineParams(
             allow_interruptions=True,  # barge-in: if you speak, the interviewer stops
-            enable_metrics=True,       # per-service latency in the log
+            enable_metrics=True,       # per-service latency (visible with LOG_LEVEL=DEBUG)
         ),
     )
 
